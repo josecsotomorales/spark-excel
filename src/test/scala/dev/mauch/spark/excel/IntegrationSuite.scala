@@ -65,20 +65,12 @@ class IntegrationSuite
     }
 
   def expectedDataTypes(inferred: DataFrame): Seq[(String, DataType)] = {
-    // Use safe approach for both Spark 3.x and 4.0
+    val data = inferred.collect()
     inferredDataTypes(exampleDataSchema)
       .to(List)
       .zip(inferred.schema)
       .zipWithIndex
-      .map { case ((f, sf), idx) => 
-        // For now, use schema-based inference to avoid data collection issues
-        sf.name -> (sf.dataType match {
-          case _: DecimalType => DoubleType
-          case _: NumericType => DoubleType  
-          case DateType => TimestampType
-          case t: DataType => t
-        })
-      }
+      .map { case ((f, sf), idx) => sf.name -> f(data.toIndexedSeq.map(_.get(idx))) }
   }
 
   def runTests(maxRowsInMemory: Option[Int], maxByteArraySize: Option[Int] = None): Unit = {
@@ -161,24 +153,20 @@ class IntegrationSuite
           val df = spark.createDataset(rows).toDF()
           val inferred = writeThenRead(df, schema = None)
 
-          // Simplified schema checking that works for both Spark 3.x and 4.0
           val expectedTypeMap = expectedDataTypes(inferred).toMap
+
+          val nonNullCounts: Array[Map[String, Int]] =
+            df.collect().map(r => df.schema.map(f => f.name -> (if (r.getAs[Any](f.name) != null) 1 else 0)).toMap)
+          val (inferableColumns, nonInferableColumns) = Monoid.combineAll(nonNullCounts).partition(_._2 > 0)
+          // Without actual data, we assume everything is a StringType
+          nonInferableColumns.keys.foreach(k => assert(inferred.schema(k).dataType == StringType))
+
+          val (actualTypes, expTypes) =
+            inferableColumns.keys
+              .map(k => (inferred.schema(k).dataType, expectedTypeMap(k)))
+              .unzip
           
-          // Check that inferred schema has reasonable types
-          inferred.schema.foreach { field =>
-            val expectedType = expectedTypeMap.get(field.name)
-            expectedType match {
-              case Some(expectedDataType) =>
-                // For columns with data, check type compatibility (allow string fallback)
-                if (field.dataType != expectedDataType && field.dataType != StringType) {
-                  // This is more lenient to handle different inference behaviors
-                  println(s"Type difference for ${field.name}: expected $expectedDataType, got ${field.dataType}")
-                }
-              case None =>
-                // Without data, should typically be StringType
-                assert(field.dataType == StringType || field.dataType.isInstanceOf[NumericType])
-            }
-          }
+          assert(actualTypes == expTypes)
         }
       }
 
